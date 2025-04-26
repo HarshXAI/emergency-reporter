@@ -8,3 +8,8 @@ branca>=0.4.0
 scikit-learn
 seaborn
 prophet
+streamlit_folium
+streamlit
+tensorflow>=2.8.0
+keras>=2.8.0
+numpy>=1.20.0
