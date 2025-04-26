@@ -16,11 +16,13 @@ from pathlib import Path
 warnings.filterwarnings('ignore')
 
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('NYPD-Forecasting')
+logger = logging.getLogger("NYPD-Forecasting")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
 
 # Create output directories if they don't exist
 Path("data").mkdir(exist_ok=True)
@@ -37,8 +39,27 @@ def load_data():
         # Convert date to datetime
         grouped_df['date'] = pd.to_datetime(grouped_df['date'])
         
+        # Standardize PRECINCT column early to ensure consistency
+        if 'PRECINCT' in grouped_df.columns:
+            grouped_df['PRECINCT'] = grouped_df['PRECINCT'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+            logger.info(f"Unique PRECINCT values in grouped_df: {sorted(grouped_df['PRECINCT'].unique().tolist())}")
+        
         # Load geospatial data
-        precinct_df = gpd.read_file('data/merged_calls_precincts.csv')
+        precinct_df = gpd.read_file('/Users/harshkanani/Desktop/Spit/data/merged_calls_precincts.geojson')
+        
+        # Standardize precinct column in geospatial data
+        if 'precinct' in precinct_df.columns:
+            precinct_df['precinct'] = precinct_df['precinct'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+            logger.info(f"Unique precinct values in precinct_df: {sorted(precinct_df['precinct'].unique().tolist())}")
+        else:
+            # Check for alternative capitalization
+            potential_columns = [col for col in precinct_df.columns if col.lower() == 'precinct']
+            if potential_columns:
+                logger.info(f"Found alternative precinct column: {potential_columns[0]}")
+                precinct_df = precinct_df.rename(columns={potential_columns[0]: 'precinct'})
+                precinct_df['precinct'] = precinct_df['precinct'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+            else:
+                logger.error("No precinct column found in geospatial data")
         
         logger.info("Data loaded successfully")
         return grouped_df, precinct_df
@@ -52,9 +73,17 @@ def explore_historical_data(grouped_df):
     """
     logger.info("Analyzing historical call patterns...")
     
-    # Aggregate call counts by precinct, date, and hour
-    hourly_agg = grouped_df.groupby(['date', 'hour']).sum()['call_count'].reset_index()
-    daily_agg = grouped_df.groupby('date').sum()['call_count'].reset_index()
+    # Check dataframe structure before aggregating
+    logger.info(f"Columns in dataframe: {grouped_df.columns.tolist()}")
+    logger.info(f"Data types: {grouped_df.dtypes}")
+    
+    # Ensure date is datetime and hour is numeric
+    grouped_df['date'] = pd.to_datetime(grouped_df['date'])
+    grouped_df['hour'] = pd.to_numeric(grouped_df['hour'], errors='coerce')
+    
+    # Aggregate call counts by precinct, date, and hour - only sum the call_count column
+    hourly_agg = grouped_df.groupby(['date', 'hour']).agg({'call_count': 'sum'}).reset_index()
+    daily_agg = grouped_df.groupby('date').agg({'call_count': 'sum'}).reset_index()
     
     # Plot hourly trends
     plt.figure(figsize=(12, 6))
@@ -83,8 +112,8 @@ def explore_historical_data(grouped_df):
     
     # Summarize top call types
     plt.figure(figsize=(12, 8))
-    call_types = grouped_df.groupby('TYP_DESC').sum()['call_count'].sort_values(ascending=False).head(5)
-    sns.barplot(x=call_types.values, y=call_types.index)
+    call_types = grouped_df.groupby('TYP_DESC').agg({'call_count': 'sum'}).sort_values('call_count', ascending=False).head(5)
+    sns.barplot(x=call_types['call_count'], y=call_types.index)
     plt.title('Top 5 Emergency Call Types')
     plt.xlabel('Total Call Count')
     plt.ylabel('Call Type Description')
@@ -171,8 +200,8 @@ def forecast_call_volumes(grouped_df):
             future = model.make_future_dataframe(periods=7, freq='D')
             forecast = model.predict(future)
             
-            # Add precinct information to forecast
-            forecast['PRECINCT'] = precinct
+            # Add precinct information to forecast - ensure it's a standardized string format
+            forecast['PRECINCT'] = str(precinct).replace('.0', '').strip()
             
             # Keep forecasts for future days only
             max_date = precinct_data['ds'].max()
@@ -204,33 +233,158 @@ def forecast_call_volumes(grouped_df):
 def create_geospatial_prediction(forecasted_calls, precinct_df):
     """
     Create a choropleth map visualizing predicted call volumes by precinct.
+    
+    Parameters:
+    - forecasted_calls: DataFrame with columns ['PRECINCT', 'predicted_calls', 'lower_bound', 'upper_bound']
+    - precinct_df: GeoDataFrame with columns ['precinct', 'geometry', 'shape_area', 'shape_leng']
+    
+    Returns:
+    - geo_forecast: Merged GeoDataFrame with geospatial and forecast data
     """
     logger.info("Creating geospatial prediction map...")
     
     try:
+        # Log input data for debugging
+        logger.info(f"Forecasted calls columns: {forecasted_calls.columns.tolist()}")
+        logger.info(f"Forecasted calls data types: {forecasted_calls.dtypes}")
+        logger.info(f"Precinct df columns: {precinct_df.columns.tolist()}")
+        logger.info(f"Precinct df data types: {precinct_df['precinct'].dtype}")
+        
+        # Standardize PRECINCT column in forecasted_calls
+        forecasted_calls['PRECINCT'] = forecasted_calls['PRECINCT'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+        
+        # Standardize precinct column in precinct_df
+        precinct_df['precinct'] = precinct_df['precinct'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+        
+        # Log sample values to debug potential mismatches
+        logger.info(f"Sample PRECINCT values in forecasted_calls: {forecasted_calls['PRECINCT'].head().tolist()}")
+        logger.info(f"Sample precinct values in precinct_df: {precinct_df['precinct'].head().tolist()}")
+        
         # Aggregate forecasted calls by precinct
-        precinct_forecast = forecasted_calls.groupby('PRECINCT').sum()['predicted_calls'].reset_index()
-        precinct_forecast.columns = ['precinct', 'predicted_calls']
+        precinct_forecast = forecasted_calls.groupby('PRECINCT').agg({
+            'predicted_calls': 'sum',
+            'lower_bound': 'sum',
+            'upper_bound': 'sum'
+        }).reset_index()
         
-        # Merge with geospatial data
+        # Rename and standardize
+        precinct_forecast.rename(columns={'PRECINCT': 'precinct'}, inplace=True)
+        precinct_forecast['precinct'] = precinct_forecast['precinct'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+        
+        # Check for any missing or extra precincts between datasets
+        forecast_precincts = set(precinct_forecast['precinct'].unique())
+        geo_precincts = set(precinct_df['precinct'].unique())
+        
+        missing_in_geo = forecast_precincts - geo_precincts
+        missing_in_forecast = geo_precincts - forecast_precincts
+        
+        if missing_in_geo:
+            logger.warning(f"Precincts in forecast but missing in geospatial data: {missing_in_geo}")
+        
+        if missing_in_forecast:
+            logger.warning(f"Precincts in geospatial data but missing in forecast: {missing_in_forecast}")
+        
+        # Merge with geospatial data - use outer join to diagnose merging issues
+        pre_merge_forecast_sum = precinct_forecast['predicted_calls'].sum()
+        logger.info(f"Sum of predicted calls before merge: {pre_merge_forecast_sum}")
+        
+        # First do an inner join to check matches
+        inner_merge = precinct_df.merge(precinct_forecast, on='precinct', how='inner')
+        logger.info(f"Number of precincts matched in inner merge: {len(inner_merge)}")
+        logger.info(f"Sum of predicted calls after inner merge: {inner_merge['predicted_calls'].sum()}")
+        
+        # If inner merge is empty or significant data loss, log details
+        if len(inner_merge) == 0 or inner_merge['predicted_calls'].sum() < pre_merge_forecast_sum * 0.9:
+            logger.error("Significant data loss in merge. Detailed match evaluation:")
+            # Compare a few example values
+            for p_idx, p_val in enumerate(precinct_forecast['precinct'].head()):
+                found = p_val in precinct_df['precinct'].values
+                logger.info(f"Precinct {p_val} from forecast {'found' if found else 'NOT FOUND'} in geo data")
+                logger.info(f"   Value type: {type(p_val)}, Length: {len(p_val)}")
+                if not found:
+                    # Try to find close matches for debugging
+                    for geo_val in precinct_df['precinct'].unique():
+                        if p_val in geo_val or geo_val in p_val:
+                            logger.info(f"   Potential match: '{geo_val}' (type: {type(geo_val)}, length: {len(geo_val)})")
+        
+        # Now do the actual left merge for the final result
         geo_forecast = precinct_df.merge(precinct_forecast, on='precinct', how='left')
-        geo_forecast['predicted_calls'].fillna(0, inplace=True)
         
-        # Identify high demand areas (top 25% of predicted calls)
-        threshold = np.percentile(geo_forecast['predicted_calls'][geo_forecast['predicted_calls'] > 0], 75)
-        geo_forecast['demand_category'] = 'Low'
-        geo_forecast.loc[geo_forecast['predicted_calls'] > threshold, 'demand_category'] = 'High'
+        # Ensure geo_forecast is a GeoDataFrame
+        if not isinstance(geo_forecast, gpd.GeoDataFrame):
+            geo_forecast = gpd.GeoDataFrame(geo_forecast, geometry='geometry')
+        
+        # Fill NaN values for forecast columns
+        geo_forecast['predicted_calls'] = geo_forecast['predicted_calls'].fillna(0)
+        geo_forecast['lower_bound'] = geo_forecast['lower_bound'].fillna(0)
+        geo_forecast['upper_bound'] = geo_forecast['upper_bound'].fillna(0)
+        
+        # Log success rate of the merge
+        total_predicted = geo_forecast['predicted_calls'].sum()
+        logger.info(f"Total predicted calls after merge: {total_predicted}")
+        
+        if total_predicted == 0:
+            logger.error("No predicted calls available after merge. Merge likely failed completely.")
+            
+            # Try a drastic approach - direct assignment if possible
+            if len(precinct_forecast) == len(precinct_df):
+                logger.info("Attempting direct assignment as last resort...")
+                # Sort both dataframes by precinct
+                precinct_forecast = precinct_forecast.sort_values('precinct').reset_index(drop=True)
+                geo_forecast = geo_forecast.sort_values('precinct').reset_index(drop=True)
+                
+                # Directly assign values
+                geo_forecast['predicted_calls'] = precinct_forecast['predicted_calls'].values
+                geo_forecast['lower_bound'] = precinct_forecast['lower_bound'].values
+                geo_forecast['upper_bound'] = precinct_forecast['upper_bound'].values
+                
+                logger.info(f"After direct assignment: {geo_forecast['predicted_calls'].sum()} total predicted calls")
+        
+        # Validate geometry column
+        if 'geometry' not in geo_forecast.columns:
+            logger.error("'geometry' column is missing in geo_forecast")
+            return None
+        
+        # Check for missing or invalid geometries
+        if geo_forecast['geometry'].isnull().any():
+            logger.error(f"Missing geometries found: {geo_forecast[geo_forecast['geometry'].isnull()]['precinct'].tolist()}")
+            return None
+        
+        # Check geometry validity (optional, requires shapely)
+        invalid_geoms = geo_forecast[~geo_forecast['geometry'].is_valid]['precinct'].tolist()
+        if invalid_geoms:
+            logger.error(f"Invalid geometries found in precincts: {invalid_geoms}")
+            return None
+        
+        # Check if there are any predicted calls
+        total_predicted_calls = geo_forecast['predicted_calls'].sum()
+        if total_predicted_calls == 0:
+            logger.warning("No predicted calls available for mapping. Setting all demand to 'Low'.")
+            geo_forecast['demand_category'] = 'Low'
+            threshold = 0
+        else:
+            # Calculate threshold for demand categories
+            positive_calls = geo_forecast['predicted_calls'][geo_forecast['predicted_calls'] > 0]
+            threshold = np.percentile(positive_calls, 75) if len(positive_calls) > 0 else 0
+            if threshold == 0:
+                logger.warning("No positive predicted calls found. Using threshold of 0.")
+            
+            # Assign demand categories
+            geo_forecast['demand_category'] = 'Low'
+            geo_forecast.loc[geo_forecast['predicted_calls'] > threshold, 'demand_category'] = 'High'
         
         # Create choropleth map
         m = folium.Map(location=[40.7128, -74.0060], zoom_start=11)
         
-        # Add choropleth layer
+        # Convert to GeoJSON for Choropleth (ensures compatibility)
+        geo_json_data = geo_forecast.to_json()
+        
         folium.Choropleth(
-            geo_data=geo_forecast,
+            geo_data=geo_json_data,
             name='Forecasted Call Volume',
             data=geo_forecast,
             columns=['precinct', 'predicted_calls'],
-            key_on='feature.properties.precinct',
+            key_on='feature.properties.precinct',  # Verify this matches your GeoJSON structure
             fill_color='YlOrRd',
             fill_opacity=0.7,
             line_opacity=0.2,
@@ -238,9 +392,9 @@ def create_geospatial_prediction(forecasted_calls, precinct_df):
             highlight=True
         ).add_to(m)
         
-        # Add popup information
+        # Add tooltips
         folium.GeoJson(
-            geo_forecast,
+            geo_json_data,
             name='Precinct Details',
             tooltip=folium.GeoJsonTooltip(
                 fields=['precinct', 'predicted_calls', 'demand_category'],
@@ -257,10 +411,11 @@ def create_geospatial_prediction(forecasted_calls, precinct_df):
         logger.info("Geospatial prediction map created successfully")
         
         return geo_forecast
+    
     except Exception as e:
         logger.error(f"Failed to create geospatial prediction: {e}")
         return None
-
+    
 def allocate_resources(geo_forecast, total_ambulances=100):
     """
     Allocate ambulances across precincts based on predicted call volumes.
